@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Walking Pad Remote</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Walking Pad Remote</h1>
+    <span id="status" class="pill">Not connected</span>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <button id="connectBtn" class="btn primary">Connect to walking pad</button>
+
+  <section class="card speed">
+    <div><span id="speedVal" class="val">0.0</span><span id="speedUnit" class="unit">mph</span></div>
+    <div id="speedSub" class="sub"></div>
+    <div class="stats">
+      <div><b id="timeVal">0:00</b><span>Time</span></div>
+      <div><b id="distVal">0.00</b><span id="distUnit">Miles</span></div>
+      <div><b id="kcalVal">–</b><span>Calories</span></div>
+    </div>
+  </section>
+
+  <section class="adjust">
+    <button id="slowerBtn" aria-label="Slower" disabled>−</button>
+    <button id="fasterBtn" aria-label="Faster" disabled>+</button>
+  </section>
+  <section id="presets" class="presets"></section>
+
+  <button id="startBtn" class="start" disabled>Start</button>
+  <button id="stopBtn" class="stop" disabled>STOP</button>
+
+  <section class="card">
+    <div class="row">
+      <span class="muted">Units</span>
+      <div class="row tight">
+        <button class="btn" data-units="mph">mph</button>
+        <button class="btn" data-units="kmh">km/h</button>
+      </div>
+    </div>
+    <div class="row spaced">
+      <label for="maxSpeed" class="muted">Speed limit</label>
+      <select id="maxSpeed" class="btn"></select>
+    </div>
+    <p class="muted note">The app never asks for more than this speed. If the walking pad goes faster for any other reason, the app slows it back down and warns you.</p>
+    <p class="muted note">Keep the walking pad's power switch within reach. It is your backup way to stop if your phone loses connection.</p>
+  </section>
+
+  <details class="card">
+    <summary>Connection log (for troubleshooting)</summary>
+    <div id="log"></div>
+  </details>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
