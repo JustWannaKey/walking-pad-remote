@@ -1,10 +1,23 @@
 "use strict";
 // ---- Bluetooth FTMS (Fitness Machine Service) identifiers ----
-const FTMS_SERVICE = 0x1826;
-const TREADMILL_DATA = 0x2acd;   // notify: live speed, distance, time...
-const CONTROL_POINT = 0x2ad9;    // write + indicate: start / stop / set speed
-const MACHINE_STATUS = 0x2ada;   // notify: started / stopped / speed changed
-const SPEED_RANGE = 0x2ad4;      // read: min / max / increment
+// Full 128-bit UUIDs: some iOS Bluetooth browsers handle these more reliably than short numbers.
+const uuid16 = (n) => "0000" + n.toString(16).padStart(4, "0") + "-0000-1000-8000-00805f9b34fb";
+const FTMS_SERVICE = uuid16(0x1826);
+const TREADMILL_DATA = uuid16(0x2acd);   // notify: live speed, distance, time...
+const CONTROL_POINT = uuid16(0x2ad9);    // write + indicate: start / stop / set speed
+const MACHINE_STATUS = uuid16(0x2ada);   // notify: started / stopped / speed changed
+const SPEED_RANGE = uuid16(0x2ad4);      // read: min / max / increment
+
+// Turns any thrown value into readable text (some browsers throw errors with no message).
+function errText(e) {
+  if (e === undefined || e === null) return "unknown error";
+  if (typeof e === "string") return e;
+  const parts = [e.name, e.message].filter(Boolean);
+  if (parts.length) return parts.join(": ");
+  try { const j = JSON.stringify(e); if (j && j !== "{}") return j; } catch {}
+  return String(e);
+}
+let step = "";
 
 const OP = { REQUEST_CONTROL: 0x00, SET_SPEED: 0x02, START: 0x07, STOP_PAUSE: 0x08, RESPONSE: 0x80 };
 const RESULT = { 1: "success", 2: "not supported", 3: "invalid parameter", 4: "failed", 5: "control not permitted" };
@@ -112,7 +125,7 @@ async function doStop() {
     await command([OP.STOP_PAUSE, 0x01], "Stop");
     state.target = null;
   } catch (e) {
-    log("Stop failed: " + e.message);
+    log("Stop failed: " + errText(e));
     showBanner("Stop command failed. Use the safety key or power switch on the walking pad now.", "err");
   }
   render();
@@ -123,8 +136,8 @@ async function doStart() {
     await command([OP.START], "Start");
     hideBanner();
   } catch (e) {
-    log(e.message);
-    showBanner("The walking pad did not accept Start. " + e.message, "warn");
+    log(errText(e));
+    showBanner("The walking pad did not accept Start. " + errText(e), "warn");
   }
 }
 
@@ -140,8 +153,8 @@ async function setSpeed(kmh) {
   try {
     await command([OP.SET_SPEED, raw & 0xff, (raw >> 8) & 0xff], "Set speed");
   } catch (e) {
-    log(e.message);
-    showBanner("The walking pad did not accept that speed. " + e.message, "warn");
+    log(errText(e));
+    showBanner("The walking pad did not accept that speed. " + errText(e), "warn");
   }
 }
 
@@ -232,25 +245,43 @@ async function connect() {
     showBanner("This browser can't use Bluetooth. On iPhone, open this page in the free Bluefy app. On Android, use Chrome.", "err");
     return;
   }
+  let device;
   try {
-    const device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [FTMS_SERVICE] }, { namePrefix: "WELLFIT" }],
-      optionalServices: [FTMS_SERVICE],
-    });
+    step = "opening device picker";
+    log("Step: " + step);
+    try {
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [FTMS_SERVICE] }, { namePrefix: "WELLFIT" }],
+        optionalServices: [FTMS_SERVICE],
+      });
+    } catch (e) {
+      if (e && e.name === "NotFoundError") throw e;  // user cancelled the picker
+      log("Filtered picker failed (" + errText(e) + "), trying the full device list");
+      step = "opening full device picker";
+      device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [FTMS_SERVICE] });
+    }
+    log("Picked: " + (device.name || "(no name)"));
     state.device = device;
     state.wantConnected = true;
     device.addEventListener("gattserverdisconnected", onDisconnected);
     await setupGatt();
   } catch (e) {
-    log("Connect failed: " + e.message);
-    if (e.name !== "NotFoundError") showBanner("Couldn't connect: " + e.message, "warn");
+    const msg = errText(e);
+    log(`Connect failed while ${step}: ${msg}`);
+    state.wantConnected = false;
+    try { if (device && device.gatt && device.gatt.connected) device.gatt.disconnect(); } catch {}
+    if (!(e && e.name === "NotFoundError")) {
+      showBanner(`Couldn't connect (while ${step}): ${msg}. Make sure nRF Connect or any other app is disconnected from the walking pad, then try again.`, "warn");
+    }
     setStatus();
   }
 }
 
 async function setupGatt() {
   $("status").textContent = "Connecting…";
+  step = "connecting to the walking pad"; log("Step: " + step);
   const server = await state.device.gatt.connect();
+  step = "finding the fitness machine service"; log("Step: " + step);
   const svc = await server.getPrimaryService(FTMS_SERVICE);
 
   try {
@@ -260,11 +291,13 @@ async function setupGatt() {
     renderLimitOptions();
   } catch (e) { log("No speed range info, using defaults"); }
 
+  step = "setting up controls"; log("Step: " + step);
   const cp = await svc.getCharacteristic(CONTROL_POINT);
   cp.addEventListener("characteristicvaluechanged", (e) => onControlPointResponse(e.target.value));
   await cp.startNotifications(); // enables indications; required before writing
   state.cp = cp;
 
+  step = "subscribing to speed data"; log("Step: " + step);
   const data = await svc.getCharacteristic(TREADMILL_DATA);
   data.addEventListener("characteristicvaluechanged", (e) => applyData(parseTreadmillData(e.target.value)));
   await data.startNotifications();
@@ -279,7 +312,7 @@ async function setupGatt() {
   log("Connected to " + (state.device.name || "walking pad"));
   hideBanner();
   try { await command([OP.REQUEST_CONTROL], "Request control"); }
-  catch (e) { log(e.message); }
+  catch (e) { log(errText(e)); }
   keepAwake();
   render();
 }
@@ -299,7 +332,7 @@ async function onDisconnected() {
   for (let attempt = 1; attempt <= 5 && state.wantConnected && !state.connected; attempt++) {
     await new Promise(r => setTimeout(r, attempt * 1000));
     try { await setupGatt(); log("Reconnected"); return; }
-    catch (e) { log(`Reconnect attempt ${attempt} failed: ${e.message}`); }
+    catch (e) { log(`Reconnect attempt ${attempt} failed: ${errText(e)}`); }
   }
   if (!state.connected) {
     showBanner(wasMoving
