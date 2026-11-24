@@ -7,6 +7,7 @@ const TREADMILL_DATA = uuid16(0x2acd);   // notify: live speed, distance, time..
 const CONTROL_POINT = uuid16(0x2ad9);    // write + indicate: start / stop / set speed
 const MACHINE_STATUS = uuid16(0x2ada);   // notify: started / stopped / speed changed
 const SPEED_RANGE = uuid16(0x2ad4);      // read: min / max / increment
+const MACHINE_FEATURE = uuid16(0x2acc);  // read: which features/commands the pad supports
 
 // Turns any thrown value into readable text (some browsers throw errors with no message).
 function errText(e) {
@@ -116,28 +117,56 @@ async function command(bytes, label) {
     res = await sendRaw(bytes);
   }
   if (res === null) { log(`${label}: no reply from pad (it may still have worked)`); return; }
-  if (res !== 1) throw new Error(`${label}: ${RESULT[res] || "error " + res}`);
+  if (res !== 1) {
+    const err = new Error(`${label}: ${RESULT[res] || "error " + res}`);
+    err.code = res;
+    throw err;
+  }
 }
 
+// Sends the first command in the list the pad accepts. Returns its label, or throws the last error.
+async function firstAccepted(attempts) {
+  let last;
+  for (const [bytes, label] of attempts) {
+    try { await command(bytes, label); return label; }
+    catch (e) { last = e; log(`${label} not accepted: ${errText(e)}`); if (!state.connected) break; }
+  }
+  throw last;
+}
+const speedBytes = (kmh) => { const raw = Math.round(kmh * 100); return [OP.SET_SPEED, raw & 0xff, (raw >> 8) & 0xff]; };
+
 // ---------- actions ----------
+// Stop: try the standard Stop, then Pause, then "speed 0". Different pads accept different ones.
 async function doStop() {
+  state.target = null;
   try {
-    await command([OP.STOP_PAUSE, 0x01], "Stop");
-    state.target = null;
+    const used = await firstAccepted([
+      [[OP.STOP_PAUSE, 0x01], "Stop"],
+      [[OP.STOP_PAUSE, 0x02], "Pause"],
+      [speedBytes(0), "Speed 0"],
+    ]);
+    if (used !== "Stop") log(`Stopped using: ${used}`);
   } catch (e) {
     log("Stop failed: " + errText(e));
-    showBanner("Stop command failed. Use the safety key or power switch on the walking pad now.", "err");
+    showBanner("The walking pad did not accept any stop command. Use its power switch now.", "err");
   }
   render();
 }
 
+// Start: try the standard Start. If the pad doesn't support it, ask for its slowest speed,
+// which starts many walking pads gently.
 async function doStart() {
+  const startKmh = Math.min(state.range.min, state.maxKmh);
   try {
-    await command([OP.START], "Start");
+    const used = await firstAccepted([
+      [[OP.START], "Start"],
+      [speedBytes(startKmh), `Start at slowest speed (${toDisplay(startKmh).toFixed(1)} ${unitLabel()})`],
+    ]);
+    if (used !== "Start") log(`Started using: ${used}`);
     hideBanner();
   } catch (e) {
     log(errText(e));
-    showBanner("The walking pad did not accept Start. " + errText(e), "warn");
+    showBanner("The walking pad did not accept Start (" + errText(e) + "). Please send a screenshot of the Connection log.", "warn");
   }
 }
 
@@ -291,6 +320,12 @@ async function setupGatt() {
     renderLimitOptions();
   } catch (e) { log("No speed range info, using defaults"); }
 
+  try {
+    const f = await (await svc.getCharacteristic(MACHINE_FEATURE)).readValue();
+    const target = f.byteLength >= 8 ? f.getUint32(4, true) : 0;
+    log(`Pad features: ${hex(f)} (speed control ${target & 1 ? "supported" : "not listed"})`);
+  } catch (e) { log("No feature info"); }
+
   step = "setting up controls"; log("Step: " + step);
   const cp = await svc.getCharacteristic(CONTROL_POINT);
   cp.addEventListener("characteristicvaluechanged", (e) => onControlPointResponse(e.target.value));
@@ -434,8 +469,14 @@ document.querySelectorAll("[data-units]").forEach(b => b.addEventListener("click
 // ---------- demo mode (open with ?demo to try the screen without a walking pad) ----------
 function connectDemo() {
   const sim = { speed: 0, target: 0, running: false, dist: 0, t: 0 };
+  const strict = new URLSearchParams(location.search).get("demo") === "strict";
   sendRaw = async (bytes) => {
     log("Demo send " + bytes.map(b => b.toString(16).padStart(2, "0")).join(" "));
+    if (strict) {
+      if (bytes[0] === OP.START || bytes[0] === OP.STOP_PAUSE) return 2;
+      if (bytes[0] === OP.SET_SPEED) { const v = (bytes[1] | (bytes[2] << 8)) / 100; sim.running = v > 0; sim.target = v; }
+      return 1;
+    }
     if (bytes[0] === OP.START) { sim.running = true; sim.target = Math.max(sim.target, state.range.min); }
     if (bytes[0] === OP.STOP_PAUSE) { sim.running = false; sim.target = 0; }
     if (bytes[0] === OP.SET_SPEED && sim.running) sim.target = (bytes[1] | (bytes[2] << 8)) / 100;
