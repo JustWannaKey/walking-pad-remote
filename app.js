@@ -1,4 +1,5 @@
 "use strict";
+const APP_VERSION = "5";
 // ---- Bluetooth FTMS (Fitness Machine Service) identifiers ----
 // Full 128-bit UUIDs: some iOS Bluetooth browsers handle these more reliably than short numbers.
 const uuid16 = (n) => "0000" + n.toString(16).padStart(4, "0") + "-0000-1000-8000-00805f9b34fb";
@@ -8,11 +9,16 @@ const CONTROL_POINT = uuid16(0x2ad9);    // write + indicate: start / stop / set
 const MACHINE_STATUS = uuid16(0x2ada);   // notify: started / stopped / speed changed
 const SPEED_RANGE = uuid16(0x2ad4);      // read: min / max / increment
 const MACHINE_FEATURE = uuid16(0x2acc);  // read: which features/commands the pad supports
+const DEVICE_INFO = uuid16(0x180a);      // read: manufacturer / model / firmware
+// Vendor services some treadmills use for their own control protocol (for diagnostics only).
+const VENDOR_SERVICES = [0xfff0, 0xffe0, 0xfee7, 0xffc0].map(uuid16);
+const ALL_OPTIONAL = [FTMS_SERVICE, DEVICE_INFO, ...VENDOR_SERVICES];
 
 // Turns any thrown value into readable text (some browsers throw errors with no message).
 function errText(e) {
   if (e === undefined || e === null) return "unknown error";
   if (typeof e === "string") return e;
+  if (typeof e === "number") return "Bluetooth error code " + e;
   const parts = [e.name, e.message].filter(Boolean);
   if (parts.length) return parts.join(": ");
   try { const j = JSON.stringify(e); if (j && j !== "{}") return j; } catch {}
@@ -103,10 +109,34 @@ let sendRaw = async (bytes) => enqueue(async () => {
   });
   const data = new Uint8Array(bytes);
   log("Send " + Array.from(data).map(b => b.toString(16).padStart(2, "0")).join(" "));
-  if (state.cp.writeValueWithResponse) await state.cp.writeValueWithResponse(data);
-  else await state.cp.writeValue(data);
+  try {
+    await writeControlPoint(data);
+  } catch (e) {
+    if (pending && pending.op === op) { clearTimeout(pending.timer); pending = null; }
+    throw e;
+  }
   return reply;
 });
+
+// Browsers differ in which write methods work, so try each one the pad allows.
+// The method that works is remembered for later commands.
+let goodWrite = null;
+async function writeControlPoint(data) {
+  const cp = state.cp;
+  const p = cp.properties || {};
+  const methods = [];
+  if (goodWrite) methods.push(goodWrite);
+  if (p.write !== false) methods.push("writeValueWithResponse", "writeValue");
+  if (p.writeWithoutResponse) methods.push("writeValueWithoutResponse");
+  if (!methods.length) methods.push("writeValue");
+  let last;
+  for (const m of [...new Set(methods)]) {
+    if (typeof cp[m] !== "function") continue;
+    try { await cp[m](data); if (goodWrite !== m) log("Write method that works: " + m); goodWrite = m; return; }
+    catch (e) { last = e; log(`${m} failed: ${errText(e)}`); }
+  }
+  throw last || new Error("No write method available");
+}
 
 async function command(bytes, label) {
   if (!state.connected) throw new Error("Not connected");
@@ -281,13 +311,13 @@ async function connect() {
     try {
       device = await navigator.bluetooth.requestDevice({
         filters: [{ services: [FTMS_SERVICE] }, { namePrefix: "WELLFIT" }],
-        optionalServices: [FTMS_SERVICE],
+        optionalServices: ALL_OPTIONAL,
       });
     } catch (e) {
       if (e && e.name === "NotFoundError") throw e;  // user cancelled the picker
       log("Filtered picker failed (" + errText(e) + "), trying the full device list");
       step = "opening full device picker";
-      device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [FTMS_SERVICE] });
+      device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: ALL_OPTIONAL });
     }
     log("Picked: " + (device.name || "(no name)"));
     state.device = device;
@@ -329,6 +359,8 @@ async function setupGatt() {
   step = "setting up controls"; log("Step: " + step);
   const cp = await svc.getCharacteristic(CONTROL_POINT);
   cp.addEventListener("characteristicvaluechanged", (e) => onControlPointResponse(e.target.value));
+  const pr = cp.properties || {};
+  log("Control channel allows: " + ["read","write","writeWithoutResponse","notify","indicate","authenticatedSignedWrites"].filter(k => pr[k]).join(", "));
   await cp.startNotifications(); // enables indications; required before writing
   state.cp = cp;
 
@@ -343,6 +375,7 @@ async function setupGatt() {
     await st.startNotifications();
   } catch (e) { log("No machine status notifications"); }
 
+  logDeviceInfo(server);
   state.connected = true;
   log("Connected to " + (state.device.name || "walking pad"));
   hideBanner();
@@ -350,6 +383,24 @@ async function setupGatt() {
   catch (e) { log(errText(e)); }
   keepAwake();
   render();
+}
+
+// Diagnostics: who made the pad and which other services it offers.
+async function logDeviceInfo(server) {
+  try {
+    const info = await server.getPrimaryService(DEVICE_INFO);
+    const dec = new TextDecoder();
+    for (const [n, label] of [[0x2a29, "Maker"], [0x2a24, "Model"], [0x2a26, "Firmware"], [0x2a27, "Hardware"]]) {
+      try { log(`${label}: ${dec.decode(await (await info.getCharacteristic(uuid16(n))).readValue())}`); } catch {}
+    }
+  } catch { log("No device info service"); }
+  for (const u of VENDOR_SERVICES) {
+    try {
+      const svc = await server.getPrimaryService(u);
+      const chars = await svc.getCharacteristics();
+      log(`Extra service ${u.slice(4, 8)}: ` + chars.map(c => c.uuid.slice(4, 8) + "[" + ["read","write","writeWithoutResponse","notify","indicate"].filter(k => c.properties[k]).join("/") + "]").join(" "));
+    } catch {}
+  }
 }
 
 async function onDisconnected() {
@@ -501,6 +552,7 @@ $("maxSpeed").addEventListener("change", (e) => {
   render();
 });
 
+log("App version " + APP_VERSION);
 renderLimitOptions();
 renderPresets();
 render();
